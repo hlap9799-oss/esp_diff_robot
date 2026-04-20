@@ -34,6 +34,34 @@ void DifferentialKinematics::SetSpeedPID(float kp, float ki, float kd)
     right.SetSpeedPID(kp, ki, kd);
 }
 
+void DifferentialKinematics::SetHeadingPID(float kp, float ki, float kd)
+{
+    headingPID.kp = kp;
+    headingPID.ki = ki;
+    headingPID.kd = kd;
+    headingPID.integral = 0.0f;
+    headingPID.previousError = 0.0f;
+}
+
+void DifferentialKinematics::SetPositionPID(float kp, float ki, float kd)
+{
+    positionPID.kp = kp;
+    positionPID.ki = ki;
+    positionPID.kd = kd;
+    positionPID.integral = 0.0f;
+    positionPID.previousError = 0.0f;
+}
+
+void DifferentialKinematics::SetMovementPIDF(float kp, float ki, float kd, float kf)
+{
+    movementPIDF.kp = kp;
+    movementPIDF.ki = ki;
+    movementPIDF.kd = kd;
+    movementPIDF.kf = kf;
+    movementPIDF.integral = 0.0f;
+    movementPIDF.previousError = 0.0f;
+}
+
 void DifferentialKinematics::SetWheelTargetsRps(float leftRps, float rightRps)
 {
     state.leftTargetRps = leftRps;
@@ -70,11 +98,198 @@ void DifferentialKinematics::ResetPose(float initialX, float initialY, float ini
     lastRightCount = right.EncoderPulseCount();
     lastUpdateMs = millis();
     state = KinematicState();
+    headingPID.integral = 0.0f;
+    headingPID.previousError = 0.0f;
 }
+
+void DifferentialKinematics::MoveForward(float distanceCm, float targetHeadingRad, float speedCmPerSec)
+{
+    movementState = MovementState::MOVING_FORWARD;
+    movementStartX = pose.x;
+    movementStartY = pose.y;
+    targetDistance = distanceCm;
+    targetLinearSpeed = speedCmPerSec;
+    targetHeadingRad = NormalizeAngle(targetHeadingRad);
+    movementDirection = 1;
+    headingPID.integral = 0.0f;
+    headingPID.previousError = 0.0f;
+}
+
+void DifferentialKinematics::MoveBackward(float distanceCm, float targetHeadingRad, float speedCmPerSec)
+{
+    movementState = MovementState::MOVING_BACKWARD;
+    movementStartX = pose.x;
+    movementStartY = pose.y;
+    targetDistance = distanceCm;
+    targetLinearSpeed = speedCmPerSec;
+    targetHeadingRad = NormalizeAngle(targetHeadingRad);
+    movementDirection = -1;
+    headingPID.integral = 0.0f;
+    headingPID.previousError = 0.0f;
+}
+
+void DifferentialKinematics::HoldPosition(float targetHeadingRad)
+{
+    movementState = MovementState::HOLDING_POSITION;
+    targetLinearSpeed = 0.0f;
+    targetHeadingRad = NormalizeAngle(targetHeadingRad);
+    headingPID.integral = 0.0f;
+    headingPID.previousError = 0.0f;
+}
+
+void DifferentialKinematics::Stop()
+{
+    movementState = MovementState::IDLE;
+    SetKinematicTargets(0.0f, 0.0f);
+    headingPID.integral = 0.0f;
+    headingPID.previousError = 0.0f;
+}
+
+bool DifferentialKinematics::IsMovementComplete() const
+{
+    if (movementState == MovementState::IDLE || movementState == MovementState::HOLDING_POSITION) {
+        return true;
+    }
+    // Calculate Euclidean distance traveled (handles rotation)
+    float deltaX = pose.x - movementStartX;
+    float deltaY = pose.y - movementStartY;
+    float distanceTraveled = sqrt(deltaX * deltaX + deltaY * deltaY);
+    return distanceTraveled >= targetDistance;
+}
+
+float DifferentialKinematics::getTotalDistance() const
+{
+    return (state.deltaLeftCm + state.deltaRightCm) * 0.5f;
+}
+
+float DifferentialKinematics::computeHeadingCorrection()
+{
+    float headingError = NormalizeAngle(targetHeadingRad - pose.headingRad);
+    uint32_t now = millis();
+    uint32_t dt = (headingPID.lastUpdateMs != 0) ? (now - headingPID.lastUpdateMs) : 0;
+    headingPID.lastUpdateMs = now;
+
+    if (dt > 0) {
+        float dtSec = dt / 1000.0f;
+        headingPID.integral += headingError * dtSec;
+        
+        // Limit integral term
+        float maxIntegral = 1.0f;
+        if (headingPID.integral > maxIntegral) headingPID.integral = maxIntegral;
+        if (headingPID.integral < -maxIntegral) headingPID.integral = -maxIntegral;
+        
+        float derivative = (dt > 0) ? (headingError - headingPID.previousError) / dtSec : 0.0f;
+        float correction = headingPID.kp * headingError + 
+                          headingPID.ki * headingPID.integral + 
+                          headingPID.kd * derivative;
+        headingPID.previousError = headingError;
+        
+        return correction;
+    }
+    return 0.0f;
+}
+
+float DifferentialKinematics::computePositionCorrection()
+{
+    // Position error in Y (lateral deviation from straight line)
+    // We want Y to stay near targetPositionY (usually 0)
+    float positionError = targetPositionY - pose.y;
+    
+    uint32_t now = millis();
+    uint32_t dt = (positionPID.lastUpdateMs != 0) ? (now - positionPID.lastUpdateMs) : 0;
+    positionPID.lastUpdateMs = now;
+
+    if (dt > 0) {
+        float dtSec = dt / 1000.0f;
+        positionPID.integral += positionError * dtSec;
+        
+        // Limit integral term
+        float maxIntegral = 1.0f;
+        if (positionPID.integral > maxIntegral) positionPID.integral = maxIntegral;
+        if (positionPID.integral < -maxIntegral) positionPID.integral = -maxIntegral;
+        
+        float derivative = (dt > 0) ? (positionError - positionPID.previousError) / dtSec : 0.0f;
+        float correction = positionPID.kp * positionError + 
+                          positionPID.ki * positionPID.integral + 
+                          positionPID.kd * derivative;
+        positionPID.previousError = positionError;
+        
+        // Return angular correction to straighten the robot's path
+        return correction;
+    }
+    return 0.0f;
+}
+
+float DifferentialKinematics::computeMovementCorrection()
+{
+    // Distance error in centimeters
+    float distanceTraveled = abs(getTotalDistance() - movementStartDistance);
+    float distanceError = targetDistance - distanceTraveled;
+    
+    uint32_t now = millis();
+    uint32_t dt = (movementPIDF.lastUpdateMs != 0) ? (now - movementPIDF.lastUpdateMs) : 0;
+    movementPIDF.lastUpdateMs = now;
+
+    if (dt > 0) {
+        float dtSec = dt / 1000.0f;
+        movementPIDF.integral += distanceError * dtSec;
+        
+        // Limit integral term
+        float maxIntegral = 5.0f;
+        if (movementPIDF.integral > maxIntegral) movementPIDF.integral = maxIntegral;
+        if (movementPIDF.integral < -maxIntegral) movementPIDF.integral = -maxIntegral;
+        
+        float derivative = (dt > 0) ? (distanceError - movementPIDF.previousError) / dtSec : 0.0f;
+        
+        // PIDF: PID + feedforward term
+        // Feedforward compensates for expected velocity to maintain target speed
+        float feedforward = movementPIDF.kf * targetLinearSpeed;
+        
+        float correction = movementPIDF.kp * distanceError + 
+                          movementPIDF.ki * movementPIDF.integral + 
+                          movementPIDF.kd * derivative +
+                          feedforward;
+        movementPIDF.previousError = distanceError;
+        
+        return correction;
+    }
+    return 0.0f;
+}
+
 
 void DifferentialKinematics::Update()
 {
     computeDerivedState();
+    
+    // Handle movement states
+    if (movementState == MovementState::MOVING_FORWARD || 
+        movementState == MovementState::MOVING_BACKWARD ||
+        movementState == MovementState::HOLDING_POSITION) {
+        
+        // Check if movement is complete
+        if (movementState != MovementState::HOLDING_POSITION && IsMovementComplete()) {
+            movementState = MovementState::IDLE;
+            SetKinematicTargets(0.0f, 0.0f);
+        } else {
+            // Compute dual corrections:
+            // 1. Heading correction (maintain target heading)
+            float headingCorrection = computeHeadingCorrection();
+            
+            // 2. Position correction (keep robot on straight line)
+            // NOTE: Only enable position correction during forward movement
+            // During backward movement, disable it to prevent unwanted rotation
+            float positionCorrection = (movementDirection > 0) ? computePositionCorrection() : 0.0f;
+            
+            // Combine corrections: sum them for total angular control
+            float totalAngularCorrection = headingCorrection + positionCorrection;
+            
+            // Apply corrected targets with combined heading + position maintenance
+            float linearSpeed = (movementState == MovementState::HOLDING_POSITION) ? 0.0f : 
+                               (movementDirection * targetLinearSpeed);
+            SetKinematicTargets(linearSpeed, totalAngularCorrection);
+        }
+    }
+    
     applyMotorTargets();
     computePoseFromEncoders();
     lastUpdateMs = millis();
@@ -125,6 +340,10 @@ void DifferentialKinematics::PrintTelemetry(Stream& output) const
     output.print(state.deltaLeftCm, 3);
     output.print(',');
     output.print(state.deltaRightCm, 3);
+    output.print(',');
+    output.print(state.leftMotorPwmPercent, 2);
+    output.print(',');
+    output.print(state.rightMotorPwmPercent, 2);
     output.println();
 }
 
@@ -194,6 +413,17 @@ void DifferentialKinematics::computeDerivedState()
     state.linearCmPerSec = (state.leftMeasuredCmPerSec + state.rightMeasuredCmPerSec) * 0.5f;
     state.angularRadPerSec = (wheelBaseCm != 0.0f) ?
         (state.rightMeasuredCmPerSec - state.leftMeasuredCmPerSec) / wheelBaseCm : 0.0f;
+    
+    // Calculate PWM percentage based on target RPS (0-10 RPS = 0-100% PWM)
+    const float maxRpsForPwm = 10.0f;
+    state.leftMotorPwmPercent = (state.leftTargetRps / maxRpsForPwm) * 100.0f;
+    state.rightMotorPwmPercent = (state.rightTargetRps / maxRpsForPwm) * 100.0f;
+    
+    // Clamp PWM to -100 to 100 range
+    if (state.leftMotorPwmPercent > 100.0f) state.leftMotorPwmPercent = 100.0f;
+    if (state.leftMotorPwmPercent < -100.0f) state.leftMotorPwmPercent = -100.0f;
+    if (state.rightMotorPwmPercent > 100.0f) state.rightMotorPwmPercent = 100.0f;
+    if (state.rightMotorPwmPercent < -100.0f) state.rightMotorPwmPercent = -100.0f;
 }
 
 void DifferentialKinematics::applyMotorTargets()
